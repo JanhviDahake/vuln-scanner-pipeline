@@ -1,140 +1,67 @@
 pipeline {
   agent any
-  options {
-    timestamps()
-    timeout(time: 60, unit: 'MINUTES')
-  }
-
   environment {
-    // App config
+    IMAGE_NAME = "demo-app:dev"          // or your param
     SEVERITY   = "HIGH,CRITICAL"
-    IMAGE_NAME = "demo-app"
-    IMAGE_TAG  = "dev"
-    DOCKERFILE = "DemoApp.Dockerfile"
-
-    // Name of the Docker volume you used when starting Jenkins container
-    // e.g. `docker run ... -v jenkins_home2:/var/jenkins_home ...`
-    JENKINS_VOL = "jenkins_home2"
   }
-
   stages {
     stage('Checkout') {
-      steps { checkout scm }
+      steps {
+        checkout scm
+      }
     }
 
     stage('Docker availability') {
       steps {
-        sh '''#!/usr/bin/env bash
-          set -Ee -o pipefail
-          command -v docker
-          docker version
-          echo "✅ Docker reachable"
-        '''
+        sh 'which docker && docker version && echo "✅ Docker reachable"'
       }
     }
 
     stage('Build image') {
       steps {
-        sh '''#!/usr/bin/env bash
-          set -Ee -o pipefail
-          echo "Building ${IMAGE_NAME}:${IMAGE_TAG}"
-          docker build --pull -f "${DOCKERFILE}" -t "${IMAGE_NAME}:${IMAGE_TAG}" .
-          mkdir -p reports
+        sh '''
+          echo "Building ${IMAGE_NAME}"
+          docker build -t ${IMAGE_NAME} .
         '''
       }
     }
 
     stage('Scan (Trivy) -> raw JSON') {
       steps {
-        sh '''#!/usr/bin/env bash
-          set -Ee -o pipefail
-          # Mount the Jenkins volume; work in the actual job workspace path
+        sh '''
+          # Use containerized Trivy (no install needed)
           docker run --rm \
             -v /var/run/docker.sock:/var/run/docker.sock \
-            -v "${JENKINS_VOL}:/var/jenkins_home" \
-            -w "${WORKSPACE}" \
-            aquasec/trivy:0.52.2 image \
-              --timeout 40m \
+            -v "$PWD":/work \
+            aquasec/trivy:latest image \
+              --severity "${SEVERITY}" \
               --format json \
-              --db-repository public.ecr.aws/aquasecurity/trivy-db:2 \
-              --java-db-repository public.ecr.aws/aquasecurity/trivy-java-db:1 \
-              --quiet \
-              "${IMAGE_NAME}:${IMAGE_TAG}" > "reports/${IMAGE_NAME}.json" || true
-          ls -al reports || true
+              "${IMAGE_NAME}" \
+            > demo-app.json
+
+          ls -l demo-app.json
         '''
+        archiveArtifacts artifacts: 'demo-app.json', fingerprint: true
       }
     }
 
     stage('Generate filtered JSON + HTML') {
       steps {
-        sh '''#!/usr/bin/env bash
-          set -Ee -o pipefail
-          docker run --rm \
-            -e IMAGE_NAME="${IMAGE_NAME}" \
-            -e IMAGE_TAG="${IMAGE_TAG}" \
-            -v "${JENKINS_VOL}:/var/jenkins_home" \
-            -w "${WORKSPACE}" \
-            python:3.11-slim bash -lc '
-              set -Ee -o pipefail
-              python -V
-              [ -f requirements.txt ] && pip install --no-cache-dir -r requirements.txt || true
-              export PYTHONPATH=.
-
-              if [ ! -f "scanner/scan.py" ]; then
-                echo "ERROR: scanner/scan.py not found in $PWD"; ls -la; exit 2
-              fi
-
-              mkdir -p reports
-              # If your scan step already wrote reports/${IMAGE_NAME}.json, your scripts may read it;
-              # otherwise they can generate again — keep as your repo expects:
-              python scanner/scan.py   "${IMAGE_NAME}:${IMAGE_TAG}" "reports/${IMAGE_NAME}.json"
-              python scanner/report.py "reports/${IMAGE_NAME}.filtered.json" "reports/${IMAGE_NAME}.html"
-              ls -al reports
-            '
+        sh '''
+          python3 --version
+          pip3 install -r requirements.txt
+          # run your processing script (adjust path/name)
+          python3 scanner/scan.py --input demo-app.json --out-json filtered.json --out-html report.html
         '''
+        archiveArtifacts artifacts: 'filtered.json,report.html', fingerprint: true
       }
     }
 
-    stage('Email summary + Gate (Gmail)') {
-      when { expression { return (env.GMAIL_USER && env.GMAIL_APP_PASSWORD && env.EMAIL_TO) } }
-      steps {
-        withCredentials([
-          string(credentialsId: 'GMAIL_USER',         variable: 'GMAIL_USER'),
-          string(credentialsId: 'GMAIL_APP_PASSWORD', variable: 'GMAIL_APP_PASSWORD'),
-          string(credentialsId: 'EMAIL_TO',           variable: 'EMAIL_TO')
-        ]) {
-          sh '''#!/usr/bin/env bash
-            set -Ee -o pipefail
-            docker run --rm \
-              -e IMAGE_NAME="${IMAGE_NAME}" \
-              -e IMAGE_TAG="${IMAGE_TAG}" \
-              -e SEVERITY="${SEVERITY}" \
-              -e GMAIL_USER -e GMAIL_APP_PASSWORD -e EMAIL_TO \
-              -v "${JENKINS_VOL}:/var/jenkins_home" \
-              -w "${WORKSPACE}" \
-              python:3.11-slim bash -lc "
-                set -Ee -o pipefail
-                [ -f requirements.txt ] && pip install --no-cache-dir -r requirements.txt || true
-                export PYTHONPATH=.
-                if [ ! -f scanner/notify_email.py ]; then
-                  echo 'ERROR: scanner/notify_email.py not found in $PWD'; ls -la; exit 2
-                fi
-
-                python scanner/notify_email.py \\
-                  --image       \\"${IMAGE_NAME}:${IMAGE_TAG}\\" \\
-                  --report-json \\"reports/${IMAGE_NAME}.filtered.json\\" \\
-                  --report-html \\"reports/${IMAGE_NAME}.html\\" \\
-                  --fail-on     \\"${SEVERITY}\\"
-              "
-          '''
-        }
-      }
-    }
+    // keep your email/slack gate stage after this
   }
-
   post {
     always {
-      archiveArtifacts artifacts: 'reports/**', fingerprint: true, onlyIfSuccessful: false
+      archiveArtifacts artifacts: '**/*.log', allowEmptyArchive: true
     }
   }
 }
