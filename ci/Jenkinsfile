@@ -6,16 +6,35 @@ pipeline {
   }
 
   environment {
+    // ---- app config ----
     SEVERITY   = "HIGH,CRITICAL"
     IMAGE_NAME = "demo-app"
     IMAGE_TAG  = "dev"
     DOCKERFILE = "DemoApp.Dockerfile"
+
+    // ---- infra wiring ----
+    // Name of the Jenkins volume you used when running the Jenkins container
+    JENKINS_VOL = "jenkins_home2"
+    // Will be set in the “Set paths” stage using the real JOB_NAME
+    WORKDIR = ""
   }
 
   stages {
 
     stage('Checkout') {
       steps { checkout scm }
+    }
+
+    stage('Set paths') {
+      steps {
+        script {
+          // Workspace path *inside the Jenkins container/volume*
+          env.WORKDIR = "/var/jenkins_home/workspace/${env.JOB_NAME}"
+          sh 'mkdir -p reports'  // ensure reports dir exists in workspace
+          echo "WORKDIR set to: ${env.WORKDIR}"
+          echo "JENKINS_VOL    : ${env.JENKINS_VOL}"
+        }
+      }
     }
 
     stage('Docker availability') {
@@ -35,19 +54,19 @@ pipeline {
           set -Eeuo pipefail
           echo "Building ${IMAGE_NAME}:${IMAGE_TAG}"
           docker build --pull -f "${DOCKERFILE}" -t "${IMAGE_NAME}:${IMAGE_TAG}" .
-          mkdir -p reports
         '''
       }
     }
 
-    stage('Scan & Generate Report') {
+    stage('Scan (Trivy) -> raw JSON') {
       steps {
-        // 1) Trivy (dockerized) → raw JSON (non-fatal if it finds vulns)
+        // Run Trivy in a container; mount the Jenkins volume and write into $WORKDIR/reports
         sh '''#!/usr/bin/env bash
           set -Eeuo pipefail
           docker run --rm \
             -v /var/run/docker.sock:/var/run/docker.sock \
-            -v "$WORKSPACE":/work -w /work \
+            -v "${JENKINS_VOL}:/var/jenkins_home" \
+            -w "${WORKDIR}" \
             aquasec/trivy:0.52.2 image \
               --timeout 40m \
               --format json \
@@ -55,35 +74,35 @@ pipeline {
               --java-db-repository public.ecr.aws/aquasecurity/trivy-java-db:1 \
               --quiet \
               "${IMAGE_NAME}:${IMAGE_TAG}" > "reports/${IMAGE_NAME}.json" || true
+          ls -al reports || true
         '''
+      }
+    }
 
-        // 2) Python wrappers (inside container) → filtered JSON + HTML
-        //    Auto-detect the folder that actually contains scanner/scan.py
+    stage('Generate filtered JSON + HTML') {
+      steps {
+        // Run Python in a container; mount the same Jenkins volume and work from $WORKDIR
         sh '''#!/usr/bin/env bash
           set -Eeuo pipefail
           docker run --rm \
             -e IMAGE_NAME="${IMAGE_NAME}" \
             -e IMAGE_TAG="${IMAGE_TAG}" \
-            -v "$WORKSPACE":/work -w /work \
+            -v "${JENKINS_VOL}:/var/jenkins_home" \
+            -w "${WORKDIR}" \
             python:3.11-slim bash -lc '
               set -Eeuo pipefail
               python -V
               [ -f requirements.txt ] && pip install --no-cache-dir -r requirements.txt || true
+              export PYTHONPATH=.
 
-              shopt -s globstar nullglob
-              APPDIR="/work"
-              if [ ! -f "/work/scanner/scan.py" ]; then
-                CAND=(/work/**/scanner/scan.py)
-                if [ ${#CAND[@]} -gt 0 ]; then
-                  APPDIR="$(dirname "$(dirname "${CAND[0]}")")"
-                else
-                  echo "ERROR: scanner/scan.py not found anywhere under /work"; exit 2
-                fi
+              # Ensure project root contains scanner/*
+              if [ ! -f "scanner/scan.py" ]; then
+                echo "ERROR: scanner/scan.py not found in $PWD"; ls -la; exit 2
               fi
-              echo "Using APPDIR: $APPDIR"
-              cd "$APPDIR"
 
               mkdir -p reports
+              # If your scan step already produced reports/${IMAGE_NAME}.json, pass it to your scripts as needed.
+              # Adjust arguments below if your repo expects different CLI params.
               python scanner/scan.py   "${IMAGE_NAME}:${IMAGE_TAG}" "reports/${IMAGE_NAME}.json"
               python scanner/report.py "reports/${IMAGE_NAME}.filtered.json" "reports/${IMAGE_NAME}.html"
               ls -al reports
@@ -93,6 +112,9 @@ pipeline {
     }
 
     stage('Email summary + Gate (Gmail)') {
+      when {
+        expression { return (env.GMAIL_USER && env.GMAIL_APP_PASSWORD && env.EMAIL_TO) }
+      }
       steps {
         withCredentials([
           string(credentialsId: 'GMAIL_USER',         variable: 'GMAIL_USER'),
@@ -106,29 +128,21 @@ pipeline {
               -e IMAGE_TAG="${IMAGE_TAG}" \
               -e SEVERITY="${SEVERITY}" \
               -e GMAIL_USER -e GMAIL_APP_PASSWORD -e EMAIL_TO \
-              -v "$WORKSPACE":/work -w /work \
+              -v "${JENKINS_VOL}:/var/jenkins_home" \
+              -w "${WORKDIR}" \
               python:3.11-slim bash -lc "
                 set -Eeuo pipefail
                 [ -f requirements.txt ] && pip install --no-cache-dir -r requirements.txt || true
-
-                shopt -s globstar nullglob
-                APPDIR=/work
-                if [ ! -f /work/scanner/notify_email.py ]; then
-                  CAND=(/work/**/scanner/notify_email.py)
-                  if [ \${#CAND[@]} -gt 0 ]; then
-                    APPDIR=\\\"\\$(dirname \\\"\\$(dirname \\\"\\${CAND[0]}\\\" )\\\")\\\"
-                  else
-                    echo \\"ERROR: scanner/notify_email.py not found anywhere under /work\\"; exit 2
-                  fi
+                export PYTHONPATH=.
+                if [ ! -f scanner/notify_email.py ]; then
+                  echo 'ERROR: scanner/notify_email.py not found in $PWD'; ls -la; exit 2
                 fi
-                echo \\"Using APPDIR: $APPDIR\\"
-                cd $APPDIR
 
                 python scanner/notify_email.py \\
-                  --image       \\\"${IMAGE_NAME}:${IMAGE_TAG}\\\" \\
-                  --report-json \\\"reports/${IMAGE_NAME}.filtered.json\\\" \\
-                  --report-html \\\"reports/${IMAGE_NAME}.html\\\" \\
-                  --fail-on     \\\"${SEVERITY}\\\"
+                  --image       \\"${IMAGE_NAME}:${IMAGE_TAG}\\" \\
+                  --report-json \\"reports/${IMAGE_NAME}.filtered.json\\" \\
+                  --report-html \\"reports/${IMAGE_NAME}.html\\" \\
+                  --fail-on     \\"${SEVERITY}\\"
               "
           '''
         }
@@ -138,7 +152,7 @@ pipeline {
 
   post {
     always {
-      archiveArtifacts artifacts: 'reports/*', onlyIfSuccessful: false
+      archiveArtifacts artifacts: 'reports/**', fingerprint: true, onlyIfSuccessful: false
     }
   }
 }
