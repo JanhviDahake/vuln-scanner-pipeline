@@ -6,41 +6,26 @@ pipeline {
   }
 
   environment {
-    // ---- app config ----
+    // App config
     SEVERITY   = "HIGH,CRITICAL"
     IMAGE_NAME = "demo-app"
     IMAGE_TAG  = "dev"
     DOCKERFILE = "DemoApp.Dockerfile"
 
-    // ---- infra wiring ----
-    // Name of the Jenkins volume you used when running the Jenkins container
+    // Name of the Docker volume you used when starting Jenkins container
+    // e.g. `docker run ... -v jenkins_home2:/var/jenkins_home ...`
     JENKINS_VOL = "jenkins_home2"
-    // Will be set in the “Set paths” stage using the real JOB_NAME
-    WORKDIR = ""
   }
 
   stages {
-
     stage('Checkout') {
       steps { checkout scm }
-    }
-
-    stage('Set paths') {
-      steps {
-        script {
-          // Workspace path *inside the Jenkins container/volume*
-          env.WORKDIR = "/var/jenkins_home/workspace/${env.JOB_NAME}"
-          sh 'mkdir -p reports'  // ensure reports dir exists in workspace
-          echo "WORKDIR set to: ${env.WORKDIR}"
-          echo "JENKINS_VOL    : ${env.JENKINS_VOL}"
-        }
-      }
     }
 
     stage('Docker availability') {
       steps {
         sh '''#!/usr/bin/env bash
-          set -Eeuo pipefail
+          set -Ee -o pipefail
           command -v docker
           docker version
           echo "✅ Docker reachable"
@@ -51,22 +36,23 @@ pipeline {
     stage('Build image') {
       steps {
         sh '''#!/usr/bin/env bash
-          set -Eeuo pipefail
+          set -Ee -o pipefail
           echo "Building ${IMAGE_NAME}:${IMAGE_TAG}"
           docker build --pull -f "${DOCKERFILE}" -t "${IMAGE_NAME}:${IMAGE_TAG}" .
+          mkdir -p reports
         '''
       }
     }
 
     stage('Scan (Trivy) -> raw JSON') {
       steps {
-        // Run Trivy in a container; mount the Jenkins volume and write into $WORKDIR/reports
         sh '''#!/usr/bin/env bash
-          set -Eeuo pipefail
+          set -Ee -o pipefail
+          # Mount the Jenkins volume; work in the actual job workspace path
           docker run --rm \
             -v /var/run/docker.sock:/var/run/docker.sock \
             -v "${JENKINS_VOL}:/var/jenkins_home" \
-            -w "${WORKDIR}" \
+            -w "${WORKSPACE}" \
             aquasec/trivy:0.52.2 image \
               --timeout 40m \
               --format json \
@@ -81,28 +67,26 @@ pipeline {
 
     stage('Generate filtered JSON + HTML') {
       steps {
-        // Run Python in a container; mount the same Jenkins volume and work from $WORKDIR
         sh '''#!/usr/bin/env bash
-          set -Eeuo pipefail
+          set -Ee -o pipefail
           docker run --rm \
             -e IMAGE_NAME="${IMAGE_NAME}" \
             -e IMAGE_TAG="${IMAGE_TAG}" \
             -v "${JENKINS_VOL}:/var/jenkins_home" \
-            -w "${WORKDIR}" \
+            -w "${WORKSPACE}" \
             python:3.11-slim bash -lc '
-              set -Eeuo pipefail
+              set -Ee -o pipefail
               python -V
               [ -f requirements.txt ] && pip install --no-cache-dir -r requirements.txt || true
               export PYTHONPATH=.
 
-              # Ensure project root contains scanner/*
               if [ ! -f "scanner/scan.py" ]; then
                 echo "ERROR: scanner/scan.py not found in $PWD"; ls -la; exit 2
               fi
 
               mkdir -p reports
-              # If your scan step already produced reports/${IMAGE_NAME}.json, pass it to your scripts as needed.
-              # Adjust arguments below if your repo expects different CLI params.
+              # If your scan step already wrote reports/${IMAGE_NAME}.json, your scripts may read it;
+              # otherwise they can generate again — keep as your repo expects:
               python scanner/scan.py   "${IMAGE_NAME}:${IMAGE_TAG}" "reports/${IMAGE_NAME}.json"
               python scanner/report.py "reports/${IMAGE_NAME}.filtered.json" "reports/${IMAGE_NAME}.html"
               ls -al reports
@@ -112,9 +96,7 @@ pipeline {
     }
 
     stage('Email summary + Gate (Gmail)') {
-      when {
-        expression { return (env.GMAIL_USER && env.GMAIL_APP_PASSWORD && env.EMAIL_TO) }
-      }
+      when { expression { return (env.GMAIL_USER && env.GMAIL_APP_PASSWORD && env.EMAIL_TO) } }
       steps {
         withCredentials([
           string(credentialsId: 'GMAIL_USER',         variable: 'GMAIL_USER'),
@@ -122,16 +104,16 @@ pipeline {
           string(credentialsId: 'EMAIL_TO',           variable: 'EMAIL_TO')
         ]) {
           sh '''#!/usr/bin/env bash
-            set -Eeuo pipefail
+            set -Ee -o pipefail
             docker run --rm \
               -e IMAGE_NAME="${IMAGE_NAME}" \
               -e IMAGE_TAG="${IMAGE_TAG}" \
               -e SEVERITY="${SEVERITY}" \
               -e GMAIL_USER -e GMAIL_APP_PASSWORD -e EMAIL_TO \
               -v "${JENKINS_VOL}:/var/jenkins_home" \
-              -w "${WORKDIR}" \
+              -w "${WORKSPACE}" \
               python:3.11-slim bash -lc "
-                set -Eeuo pipefail
+                set -Ee -o pipefail
                 [ -f requirements.txt ] && pip install --no-cache-dir -r requirements.txt || true
                 export PYTHONPATH=.
                 if [ ! -f scanner/notify_email.py ]; then
