@@ -12,12 +12,13 @@ pipeline {
     IMAGE_TAG  = "dev"
     SEVERITY   = "HIGH,CRITICAL"
 
-    // Name of the Docker volume you used when starting Jenkins:
+    // Name of the Docker volume used to run Jenkins:
     //   docker run ... -v jenkins_home2:/var/jenkins_home ...
     JENKINS_VOL = "jenkins_home2"
   }
 
   stages {
+
     stage('Checkout') {
       steps { checkout scm }
     }
@@ -25,9 +26,17 @@ pipeline {
     stage('Docker availability') {
       steps {
         sh '''#!/usr/bin/env bash
-          set -e
-          which docker
+          set -euxo pipefail
+          echo "== Docker availability check =="
+          if ! command -v docker >/dev/null 2>&1; then
+            echo "❌ Docker CLI not found in PATH inside Jenkins container."
+            echo "Hint: start Jenkins with:"
+            echo "  -v /var/run/docker.sock:/var/run/docker.sock"
+            echo "  -v /usr/bin/docker:/usr/bin/docker  (or install docker.io in the container)"
+            exit 1
+          fi
           docker version
+          ls -l /var/run/docker.sock || true
           echo "✅ Docker reachable"
         '''
       }
@@ -36,9 +45,9 @@ pipeline {
     stage('Build image') {
       steps {
         sh '''#!/usr/bin/env bash
-          set -e
+          set -euxo pipefail
           echo "Building ${IMAGE_REPO}:${IMAGE_TAG}"
-          docker build -t ${IMAGE_REPO}:${IMAGE_TAG} .
+          docker build --pull -t ${IMAGE_REPO}:${IMAGE_TAG} .
           mkdir -p reports
         '''
       }
@@ -47,13 +56,13 @@ pipeline {
     stage('Scan (Trivy) -> raw JSON') {
       steps {
         sh '''#!/usr/bin/env bash
-          set -e
-          # Run Trivy inside its container; mount Jenkins volume and work from the job's workspace
+          set -euxo pipefail
+          # Run Trivy in container; mount Jenkins volume and work from this job's workspace
           docker run --rm \
             -v /var/run/docker.sock:/var/run/docker.sock \
             -v "${JENKINS_VOL}:/var/jenkins_home" \
             -w "${WORKSPACE}" \
-            aquasec/trivy:latest image \
+            aquasec/trivy:0.66.0 image \
               --severity "${SEVERITY}" \
               --format json \
               "${IMAGE_REPO}:${IMAGE_TAG}" \
@@ -68,27 +77,27 @@ pipeline {
     stage('Generate filtered JSON + HTML') {
       steps {
         sh '''#!/usr/bin/env bash
-          set -e
-          # Run Python inside its container; mount the same Jenkins volume and work from the job's workspace
+          set -euxo pipefail
+          # Run Python in container; mount the same Jenkins volume and work from this job's workspace
           docker run --rm \
             -v "${JENKINS_VOL}:/var/jenkins_home" \
             -w "${WORKSPACE}" \
             python:3.11-slim bash -lc "
-              set -e
+              set -euxo pipefail
               python -V
               [ -f requirements.txt ] && pip install --no-cache-dir -r requirements.txt || true
               export PYTHONPATH=.
 
-              # If your repo expects to generate filtered JSON + HTML from the Trivy JSON:
-              if [ ! -f scanner/report.py ]; then
-                echo 'ERROR: scanner/report.py not found in $PWD'; ls -la; exit 2
-              fi
+              # Ensure expected scripts exist
+              [ -f scanner/report.py ] || { echo 'ERROR: scanner/report.py not found in $PWD'; ls -la; exit 2; }
 
               mkdir -p reports
-              # Adjust the arguments below to match your scripts:
-              # If your scanner/report.py consumes the raw Trivy JSON and writes filtered+HTML:
+
+              # If your report.py consumes the raw Trivy JSON and writes HTML:
+              #   python scanner/report.py <in_json> <out_html>
               python scanner/report.py \\"reports/${IMAGE_REPO}.json\\" \\"reports/${IMAGE_REPO}.html\\"
-              # If you also produce a filtered JSON, add that line (uncomment if applicable):
+
+              # If you also want a filtered JSON and your scripts support it, uncomment and adapt:
               # python scanner/scan.py   \\"${IMAGE_REPO}:${IMAGE_TAG}\\" \\"reports/${IMAGE_REPO}.json\\"
               # python scanner/report.py \\"reports/${IMAGE_REPO}.filtered.json\\" \\"reports/${IMAGE_REPO}.html\\"
 
@@ -99,39 +108,42 @@ pipeline {
       }
     }
 
-    // Optional: Email/Slack gate (only runs if you add credentials and want alerts)
-    // stage('Email summary + Gate (Gmail)') {
-    //   steps {
-    //     withCredentials([
-    //       string(credentialsId: 'GMAIL_USER',         variable: 'GMAIL_USER'),
-    //       string(credentialsId: 'GMAIL_APP_PASSWORD', variable: 'GMAIL_APP_PASSWORD'),
-    //       string(credentialsId: 'EMAIL_TO',           variable: 'EMAIL_TO')
-    //     ]) {
-    //       sh '''#!/usr/bin/env bash
-    //         set -e
-    //         docker run --rm \
-    //           -e IMAGE_NAME="${IMAGE_REPO}:${IMAGE_TAG}" \
-    //           -e SEVERITY="${SEVERITY}" \
-    //           -e GMAIL_USER -e GMAIL_APP_PASSWORD -e EMAIL_TO \
-    //           -v "${JENKINS_VOL}:/var/jenkins_home" \
-    //           -w "${WORKSPACE}" \
-    //           python:3.11-slim bash -lc "
-    //             set -e
-    //             [ -f requirements.txt ] && pip install --no-cache-dir -r requirements.txt || true
-    //             export PYTHONPATH=.
-    //             if [ ! -f scanner/notify_email.py ]; then
-    //               echo 'ERROR: scanner/notify_email.py not found in $PWD'; ls -la; exit 2
-    //             fi
-    //             python scanner/notify_email.py \\
-    //               --image       \\"${IMAGE_REPO}:${IMAGE_TAG}\\" \\
-    //               --report-json \\"reports/${IMAGE_REPO}.json\\" \\
-    //               --report-html \\"reports/${IMAGE_REPO}.html\\" \\
-    //               --fail-on     \\"${SEVERITY}\\"
-    //           "
-    //       '''
-    //     }
-    //   }
-    // }
+    // Optional: Email/Slack gates. Uncomment & configure credentials in Jenkins if you want alerts.
+    /*
+    stage('Email summary + Gate (Gmail)') {
+      when {
+        expression { return (env.GMAIL_USER && env.GMAIL_APP_PASSWORD && env.EMAIL_TO) }
+      }
+      steps {
+        withCredentials([
+          string(credentialsId: 'GMAIL_USER',         variable: 'GMAIL_USER'),
+          string(credentialsId: 'GMAIL_APP_PASSWORD', variable: 'GMAIL_APP_PASSWORD'),
+          string(credentialsId: 'EMAIL_TO',           variable: 'EMAIL_TO')
+        ]) {
+          sh '''#!/usr/bin/env bash
+            set -euxo pipefail
+            docker run --rm \
+              -e IMAGE_NAME="${IMAGE_REPO}:${IMAGE_TAG}" \
+              -e SEVERITY="${SEVERITY}" \
+              -e GMAIL_USER -e GMAIL_APP_PASSWORD -e EMAIL_TO \
+              -v "${JENKINS_VOL}:/var/jenkins_home" \
+              -w "${WORKSPACE}" \
+              python:3.11-slim bash -lc "
+                set -euxo pipefail
+                [ -f requirements.txt ] && pip install --no-cache-dir -r requirements.txt || true
+                export PYTHONPATH=.
+                [ -f scanner/notify_email.py ] || { echo 'ERROR: scanner/notify_email.py not found'; ls -la; exit 2; }
+                python scanner/notify_email.py \\
+                  --image       \\"${IMAGE_REPO}:${IMAGE_TAG}\\" \\
+                  --report-json \\"reports/${IMAGE_REPO}.json\\" \\
+                  --report-html \\"reports/${IMAGE_REPO}.html\\" \\
+                  --fail-on     \\"${SEVERITY}\\"
+              "
+          '''
+        }
+      }
+    }
+    */
   }
 
   post {
