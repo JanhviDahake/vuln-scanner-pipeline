@@ -1,67 +1,142 @@
 pipeline {
   agent any
-  environment {
-    IMAGE_NAME = "demo-app:dev"          // or your param
-    SEVERITY   = "HIGH,CRITICAL"
+
+  options {
+    timestamps()
+    timeout(time: 60, unit: 'MINUTES')
   }
+
+  environment {
+    // Image to build & scan
+    IMAGE_REPO = "demo-app"
+    IMAGE_TAG  = "dev"
+    SEVERITY   = "HIGH,CRITICAL"
+
+    // Name of the Docker volume you used when starting Jenkins:
+    //   docker run ... -v jenkins_home2:/var/jenkins_home ...
+    JENKINS_VOL = "jenkins_home2"
+  }
+
   stages {
     stage('Checkout') {
-      steps {
-        checkout scm
-      }
+      steps { checkout scm }
     }
 
     stage('Docker availability') {
       steps {
-        sh 'which docker && docker version && echo "✅ Docker reachable"'
+        sh '''#!/usr/bin/env bash
+          set -e
+          which docker
+          docker version
+          echo "✅ Docker reachable"
+        '''
       }
     }
 
     stage('Build image') {
       steps {
-        sh '''
-          echo "Building ${IMAGE_NAME}"
-          docker build -t ${IMAGE_NAME} .
+        sh '''#!/usr/bin/env bash
+          set -e
+          echo "Building ${IMAGE_REPO}:${IMAGE_TAG}"
+          docker build -t ${IMAGE_REPO}:${IMAGE_TAG} .
+          mkdir -p reports
         '''
       }
     }
 
     stage('Scan (Trivy) -> raw JSON') {
       steps {
-        sh '''
-          # Use containerized Trivy (no install needed)
+        sh '''#!/usr/bin/env bash
+          set -e
+          # Run Trivy inside its container; mount Jenkins volume and work from the job's workspace
           docker run --rm \
             -v /var/run/docker.sock:/var/run/docker.sock \
-            -v "$PWD":/work \
+            -v "${JENKINS_VOL}:/var/jenkins_home" \
+            -w "${WORKSPACE}" \
             aquasec/trivy:latest image \
               --severity "${SEVERITY}" \
               --format json \
-              "${IMAGE_NAME}" \
-            > demo-app.json
+              "${IMAGE_REPO}:${IMAGE_TAG}" \
+            > "reports/${IMAGE_REPO}.json"
 
-          ls -l demo-app.json
+          ls -lh reports || true
         '''
-        archiveArtifacts artifacts: 'demo-app.json', fingerprint: true
+        archiveArtifacts artifacts: 'reports/*.json', fingerprint: true
       }
     }
 
     stage('Generate filtered JSON + HTML') {
       steps {
-        sh '''
-          python3 --version
-          pip3 install -r requirements.txt
-          # run your processing script (adjust path/name)
-          python3 scanner/scan.py --input demo-app.json --out-json filtered.json --out-html report.html
+        sh '''#!/usr/bin/env bash
+          set -e
+          # Run Python inside its container; mount the same Jenkins volume and work from the job's workspace
+          docker run --rm \
+            -v "${JENKINS_VOL}:/var/jenkins_home" \
+            -w "${WORKSPACE}" \
+            python:3.11-slim bash -lc "
+              set -e
+              python -V
+              [ -f requirements.txt ] && pip install --no-cache-dir -r requirements.txt || true
+              export PYTHONPATH=.
+
+              # If your repo expects to generate filtered JSON + HTML from the Trivy JSON:
+              if [ ! -f scanner/report.py ]; then
+                echo 'ERROR: scanner/report.py not found in $PWD'; ls -la; exit 2
+              fi
+
+              mkdir -p reports
+              # Adjust the arguments below to match your scripts:
+              # If your scanner/report.py consumes the raw Trivy JSON and writes filtered+HTML:
+              python scanner/report.py \\"reports/${IMAGE_REPO}.json\\" \\"reports/${IMAGE_REPO}.html\\"
+              # If you also produce a filtered JSON, add that line (uncomment if applicable):
+              # python scanner/scan.py   \\"${IMAGE_REPO}:${IMAGE_TAG}\\" \\"reports/${IMAGE_REPO}.json\\"
+              # python scanner/report.py \\"reports/${IMAGE_REPO}.filtered.json\\" \\"reports/${IMAGE_REPO}.html\\"
+
+              ls -lh reports
+            "
         '''
-        archiveArtifacts artifacts: 'filtered.json,report.html', fingerprint: true
+        archiveArtifacts artifacts: 'reports/*.html, reports/*.json', fingerprint: true, allowEmptyArchive: true
       }
     }
 
-    // keep your email/slack gate stage after this
+    // Optional: Email/Slack gate (only runs if you add credentials and want alerts)
+    // stage('Email summary + Gate (Gmail)') {
+    //   steps {
+    //     withCredentials([
+    //       string(credentialsId: 'GMAIL_USER',         variable: 'GMAIL_USER'),
+    //       string(credentialsId: 'GMAIL_APP_PASSWORD', variable: 'GMAIL_APP_PASSWORD'),
+    //       string(credentialsId: 'EMAIL_TO',           variable: 'EMAIL_TO')
+    //     ]) {
+    //       sh '''#!/usr/bin/env bash
+    //         set -e
+    //         docker run --rm \
+    //           -e IMAGE_NAME="${IMAGE_REPO}:${IMAGE_TAG}" \
+    //           -e SEVERITY="${SEVERITY}" \
+    //           -e GMAIL_USER -e GMAIL_APP_PASSWORD -e EMAIL_TO \
+    //           -v "${JENKINS_VOL}:/var/jenkins_home" \
+    //           -w "${WORKSPACE}" \
+    //           python:3.11-slim bash -lc "
+    //             set -e
+    //             [ -f requirements.txt ] && pip install --no-cache-dir -r requirements.txt || true
+    //             export PYTHONPATH=.
+    //             if [ ! -f scanner/notify_email.py ]; then
+    //               echo 'ERROR: scanner/notify_email.py not found in $PWD'; ls -la; exit 2
+    //             fi
+    //             python scanner/notify_email.py \\
+    //               --image       \\"${IMAGE_REPO}:${IMAGE_TAG}\\" \\
+    //               --report-json \\"reports/${IMAGE_REPO}.json\\" \\
+    //               --report-html \\"reports/${IMAGE_REPO}.html\\" \\
+    //               --fail-on     \\"${SEVERITY}\\"
+    //           "
+    //       '''
+    //     }
+    //   }
+    // }
   }
+
   post {
     always {
-      archiveArtifacts artifacts: '**/*.log', allowEmptyArchive: true
+      archiveArtifacts artifacts: 'reports/**', fingerprint: true, onlyIfSuccessful: false, allowEmptyArchive: true
     }
   }
 }
